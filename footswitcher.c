@@ -1,3 +1,4 @@
+/* Work in progress */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -12,8 +13,11 @@
 #include <linux/input.h>
 
 #include <libevdev/libevdev.h>
+#include <libevdev/libevdev-uinput.h>
 
 #define MAX_EVENTS 5
+#define UP 0
+#define DOWN 1
 
 void err_exit(int, char *);
 void process_events();
@@ -21,6 +25,9 @@ int process_dev(struct libevdev *dev, void (* fn)(struct input_event *));
 void switch_fn(struct input_event *ev);
 void keyboard_fn(struct input_event *ev);
 int add_event(int fd, struct libevdev *dev);
+int create_uinput();
+int send_keys(int, int, int);
+int send_key(int, int);
 
 char *KEY_STATE[] = { "up", "down" };
 struct libevdev *dev = NULL;
@@ -31,6 +38,7 @@ int epoll_fd;
 struct epoll_event events[MAX_EVENTS];
 int next_event;
 int key_pressed;
+struct libevdev_uinput *uidev;
 
 int main(int argc, char **argv) {
     epoll_fd = epoll_create(1);
@@ -90,10 +98,32 @@ int main(int argc, char **argv) {
             exit(3);
         }
 
+        if(rc = create_uinput()) {
+            err_exit(rc, "Failed to create uinput");
+        }
+
+        printf("Uinput device node=%s\n", libevdev_uinput_get_devnode(uidev));
+
         process_events();
         perror("epoll_wait failed");
         exit(1);
     }
+}
+
+int create_uinput() {
+    int rc;
+    dev = libevdev_new();
+    libevdev_set_name(dev, "footswitcher");
+    libevdev_enable_event_type(dev, EV_KEY);
+    libevdev_enable_event_code(dev, EV_KEY, KEY_LEFTCTRL, NULL);
+    libevdev_enable_event_code(dev, EV_KEY, KEY_LEFTSHIFT, NULL);
+    libevdev_enable_event_code(dev, EV_KEY, KEY_LEFTALT, NULL);
+    libevdev_enable_event_code(dev, EV_KEY, KEY_ESC, NULL);
+    libevdev_enable_event_code(dev, EV_KEY, KEY_TAB, NULL);
+    libevdev_enable_event_code(dev, EV_KEY, BTN_MIDDLE, NULL);
+    return libevdev_uinput_create_from_device(dev,
+        LIBEVDEV_UINPUT_OPEN_MANAGED,
+        &uidev);
 }
 
 void process_events() {
@@ -122,7 +152,6 @@ int process_dev(struct libevdev *dev, void (* fn)(struct input_event *)) {
     do {
         struct input_event ev;
         rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL|LIBEVDEV_READ_FLAG_BLOCKING, &ev);
-        printf("Next event rc=%d\n", rc);
         if (rc == LIBEVDEV_READ_STATUS_SYNC) {
             // Resync
             while (rc == LIBEVDEV_READ_STATUS_SYNC) {
@@ -142,37 +171,42 @@ void switch_fn(struct input_event *ev) {
     if(ev->type == EV_KEY) {
         switch(ev->code) {
         case BTN_LEFT:
-            printf("Ctrl %s\n", KEY_STATE[ev->value]);
-            if(ev->value == 0 && !key_pressed) {
-                printf("Esc down\nEsc up\n");
-            } else {
-                key_pressed = 0;
-            }
+            send_keys(KEY_LEFTCTRL, KEY_ESC, ev->value);
             break;
         case BTN_RIGHT:
-            printf("Shift %s\n", KEY_STATE[ev->value]);
-            if(ev->value == 0 && !key_pressed) {
-                printf("Tab down\nTab up\n");
-            } else {
-                key_pressed = 0;
-            }
+            send_keys(KEY_LEFTALT, KEY_TAB, ev->value);
             break;
         case BTN_MIDDLE:
-            printf("Alt %s\n", KEY_STATE[ev->value]);
-            if(ev->value == 0 && !key_pressed) {
-                printf("Right mouse down\nRight mouse up\n");
-            } else {
-                key_pressed = 0;
-            }
+            send_keys(KEY_LEFTSHIFT, BTN_MIDDLE, ev->value);
             break;
         }
+    }
+}
+
+int send_keys(int up_down_key, int after_up_key, int up_down) {
+    send_key(up_down_key, up_down);
+    if(UP == up_down && !key_pressed) {
+        send_key(after_up_key, DOWN);
+        send_key(after_up_key, UP);
+    } else {
+        key_pressed = 0;
+    }
+}
+
+int send_key(int key, int value) {
+    int rc = libevdev_uinput_write_event(uidev, EV_KEY, key, value);
+    if(rc)  {
+        err_exit(rc, "Failed to write uinput event");
+    }
+    rc = libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+    if(rc) {
+        err_exit(rc, "Failed to write uinput sync event");
     }
 }
 
 void keyboard_fn(struct input_event *ev) {
     if(ev->type == EV_KEY) {
         key_pressed = 1;
-        printf("Keyboard event\n");
     }
 }
 
@@ -182,7 +216,6 @@ int add_event(int fd, struct libevdev *dev) {
     ev.data.ptr = dev;
     ev.events = EPOLLIN;
     int rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-    printf("epoll_ctl(%d, %d, %d, ..)=>%d\n", epoll_fd, EPOLL_CTL_ADD, fd, rc);
     return rc;
 }
 
